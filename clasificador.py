@@ -1,0 +1,233 @@
+# =====================================================================
+# LIBRERÍAS Y CONFIGURACIÓN INICIAL
+# =====================================================================
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import cv2
+import time  
+import serial  
+from sklearn.model_selection import train_test_split
+
+
+print("Versión de TensorFlow:", tf.__version__)
+
+# =====================================================================
+# CONFIGURACIÓN DEL PUERTO SERIAL
+# =====================================================================
+PUERTO_SERIAL = 'COM4'  # Cambia por tu puerto serial si es necesario
+BAUD_RATE = 9600
+
+try:
+    arduino = serial.Serial(PUERTO_SERIAL, BAUD_RATE, timeout=1)
+    print(f"¡Conexión serial establecida con éxito en {PUERTO_SERIAL}!")
+except Exception as e:
+    print(f"Advertencia: No se pudo abrir el puerto serial {PUERTO_SERIAL}: {e}")
+    arduino = None
+
+# =====================================================================
+# 1. CARGAR LAS IMÁGENES COMPLETAS DESDE TUS CARPETAS
+# =====================================================================
+print("Cargando el dataset de imágenes completas...")
+
+ruta_dataset = r"C:\Users\adria\Documents\dataset" 
+IMG_SIZE = 64  # Tamaño al que se redimensionarán las imágenes para la CNN
+
+X_data = []
+y_data = []
+
+class_names = sorted(os.listdir(ruta_dataset))
+class_names = [c for c in class_names if os.path.isdir(os.path.join(ruta_dataset, c))]
+print(f"Clases de colores encontradas: {class_names}")
+num_classes = len(class_names)
+
+for idx, clase in enumerate(class_names):
+    carpeta_clase = os.path.join(ruta_dataset, clase)
+    imagenes_en_clase = 0
+    
+    for nombre_archivo in os.listdir(carpeta_clase):
+        if nombre_archivo.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
+            ruta_imagen = os.path.join(carpeta_clase, nombre_archivo)
+            
+            img = cv2.imread(ruta_imagen)
+            if img is not None:
+                img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+                img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+                
+                X_data.append(img_rgb)
+                y_data.append(idx)
+                imagenes_en_clase += 1
+
+    print(f"-> Categoría '{clase}': se leyeron {imagenes_en_clase} imágenes correctamente.")
+
+X_data = np.array(X_data, dtype=np.float32)
+y_data = np.array(y_data, dtype=np.int32)
+X_data /= 255.0
+
+print(f"\n¡Total de imágenes cargadas: {len(X_data)}!\n")
+
+# =====================================================================
+# 2. SEPARACIÓN EN ENTRENAMIENTO Y PRUEBA
+# =====================================================================
+X_train, X_test, y_train, y_test = train_test_split(X_data, y_data, test_size=0.2, random_state=42)
+
+# =====================================================================
+# 3. CREACIÓN Y ENTRENAMIENTO DEL MODELO CNN
+# =====================================================================
+print("Construyendo el modelo de Red Neuronal Convolucional (CNN)...")
+model = tf.keras.Sequential([
+    tf.keras.layers.Conv2D(32, (3, 3), activation='relu', input_shape=(IMG_SIZE, IMG_SIZE, 3)),
+    tf.keras.layers.MaxPooling2D(2, 2),
+    tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
+    tf.keras.layers.MaxPooling2D(2, 2),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(128, activation='relu'),
+    tf.keras.layers.Dropout(0.3),
+    tf.keras.layers.Dense(num_classes)
+])
+
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+              loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+              metrics=['accuracy'])
+
+print("\n--- Iniciando entrenamiento de la CNN por 15 épocas ---")
+history = model.fit(X_train, y_train, epochs=15, validation_data=(X_test, y_test), verbose=1)
+
+test_loss, test_acc = model.evaluate(X_test, y_test, verbose=2)
+print(f'\n¡Precisión final en pruebas (Test accuracy): {test_acc * 100:.2f}%!')
+
+probability_model = tf.keras.Sequential([
+    model,
+    tf.keras.layers.Softmax()
+])
+
+# =====================================================================
+# 4. CONEXIÓN A CÁMARA Y PREDICCIÓN EN TIEMPO REAL + ENVÍO SERIAL
+# =====================================================================
+print("\n--- Intentando conectar con la cámara ---")
+plt.close('all')
+
+cap = None
+for idx in [1, 2, 0]:
+    print(f"Probando cámara en el índice {idx}...")
+    temp_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+    if temp_cap.isOpened():
+        cap = temp_cap
+        print(f"¡Cámara conectada exitosamente en el índice {idx}!")
+        break
+    temp_cap.release()
+
+if cap is None or not cap.isOpened():
+    print("Error crítico: No se pudo abrir ninguna cámara.")
+    exit()
+
+print("¡Cámara abierta! Coloca el objeto dentro del cuadro verde. Presiona 'q' para salir.")
+
+estado_sistema = "ESPERANDO"  # Estados: "ESPERANDO", "EJECUTANDO_CICLO", "ESPERANDO_QUE_RETIRE", "ESPERANDO_NUEVO_COLOR"
+tiempo_ciclo_actual = 2.2     # Almacena el tiempo que debe esperar Python según el color
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Advertencia: No se pudo leer el fotograma de la cámara.")
+        break
+
+    h, w, _ = frame.shape
+    box_size = 150  
+    x1 = (w - box_size) // 2
+    y1 = (h - box_size) // 2
+    x2 = x1 + box_size
+    y2 = y1 + box_size
+
+    roi = frame[y1:y2, x1:x2]
+    
+    # =================================================================
+    # FILTRO DE FONDO VACÍO (Evita falsas detecciones en la madera)
+    # =================================================================
+    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    saturacion_media = np.mean(hsv_roi[:, :, 1]) 
+    brillo_medio = np.mean(hsv_roi[:, :, 2])     
+
+    if saturacion_media < 45 or brillo_medio < 50:
+        clase_predicha = "vacio"
+        confidence = 0.0
+    else:
+        roi_resized = cv2.resize(roi, (IMG_SIZE, IMG_SIZE))
+        roi_rgb = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)
+        
+        live_img = np.expand_dims(roi_rgb, axis=0).astype(np.float32) / 255.0
+
+        live_predictions = probability_model.predict(live_img, verbose=0)
+        predicted_label_idx = np.argmax(live_predictions[0])
+        confidence = np.max(live_predictions[0]) * 100
+        clase_predicha = class_names[predicted_label_idx].lower()
+
+    # =================================================================
+    # MÁQUINA DE ESTADOS LÓGICA
+    # =================================================================
+    if estado_sistema == "ESPERANDO":
+        if confidence > 80:
+            if "verde" in clase_predicha:
+                print(f"\n[VERDE DETECTADO - {confidence:.1f}%] Banda avanza 1s, se detiene y activa servo verde...")
+                if arduino and arduino.is_open:
+                    arduino.write(b'V')
+                    arduino.flush()
+                tiempo_ciclo_actual = 2.2  # 1s banda + 1.2s servo
+                estado_sistema = "EJECUTANDO_CICLO"
+                
+            elif "azul" in clase_predicha:
+                print(f"\n[AZUL DETECTADO - {confidence:.1f}%] Banda avanza 0.30s, se detiene y activa servo azul...")
+                if arduino and arduino.is_open:
+                    arduino.write(b'A')
+                    arduino.flush()
+                tiempo_ciclo_actual = 1.65  # 0.30s banda + 1.2s servo
+                estado_sistema = "EJECUTANDO_CICLO"
+
+    elif estado_sistema == "EJECUTANDO_CICLO":
+        # Espera dinámica según el color seleccionado
+        time.sleep(tiempo_ciclo_actual) 
+        print("Ciclo completado. Banda detenida. Esperando a que se retire el chocolate...")
+        estado_sistema = "ESPERANDO_QUE_RETIRE"
+
+    elif estado_sistema == "ESPERANDO_QUE_RETIRE":
+        # Paso 1: Esperamos a que la cámara detecte que el cuadro está vacío
+        if clase_predicha == "vacio":
+            print("Objeto retirado. Esperando a que detecte un nuevo color...")
+            estado_sistema = "ESPERANDO_NUEVO_COLOR"
+
+    elif estado_sistema == "ESPERANDO_NUEVO_COLOR":
+        # Paso 2: La banda NO se mueve hasta que detecte un color válido con alta confianza
+        if confidence > 80 and clase_predicha != "vacio":
+            print(f"\n[NUEVO COLOR DETECTADO: {clase_predicha} - {confidence:.1f}%] ¡Iniciando ciclo!")
+            if "verde" in clase_predicha:
+                if arduino and arduino.is_open:
+                    arduino.write(b'V')
+                    arduino.flush()
+                tiempo_ciclo_actual = 2.2
+                estado_sistema = "EJECUTANDO_CICLO"
+            elif "azul" in clase_predicha:
+                if arduino and arduino.is_open:
+                    arduino.write(b'A')
+                    arduino.flush()
+                tiempo_ciclo_actual = 1.5
+                estado_sistema = "EJECUTANDO_CICLO"
+
+    # Mostrar resultado visual en pantalla
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+    text_to_display = f"{clase_predicha}: {confidence:.1f}%"
+    cv2.putText(frame, text_to_display, (x1, y1 - 15), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+    cv2.imshow('Clasificador - En Vivo', frame)
+    cv2.imshow('Vision del Recuadro (ROI)', roi)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Cierre seguro de recursos
+if arduino and arduino.is_open:
+    arduino.close()
+cap.release()
+cv2.destroyAllWindows()
+print("Cámara y puerto serial cerrados correctamente.")
